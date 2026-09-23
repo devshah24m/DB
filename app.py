@@ -1370,6 +1370,8 @@ class LiveEngine:
 @st.cache_resource(show_spinner="Fetching ledger from Google Sheet (Apps Script)...")
 def get_engine(apps_script_url: str, sheet_name: str | None):
     records = _fetch_ledger_records(apps_script_url, sheet_name)
+    from corporate_actions import apply_confirmed_actions
+    records = apply_confirmed_actions(records)  # bake in confirmed Split/Bonus before FIFO
     rows = load_trade_ledger_from_records(records)
     return LiveEngine(rows, apps_script_url=apps_script_url, ledger_sheet_name=sheet_name)
 
@@ -1967,7 +1969,9 @@ def render_live(engine: "LiveEngine"):
         unsafe_allow_html=True,
     )
 
-    tab_open, tab_closed, tab_news = st.tabs(["📈 Open positions", "✅ Closed positions", "📰 News"])
+    tab_open, tab_closed, tab_news, tab_corp = st.tabs(
+        ["📈 Open positions", "✅ Closed positions", "📰 News", "🏢 Corporate Actions"]
+    )
 
     with tab_open:
         open_segments = [
@@ -2606,6 +2610,60 @@ def render_live(engine: "LiveEngine"):
             render_news_section(open_symbols, scope_key="open", scope_noun="open positions")
         with news_tab_closed:
             render_news_section(closed_symbols, scope_key="closed", scope_noun="closed positions")
+
+    with tab_corp:
+        from corporate_actions import (
+            get_pending_actions, get_applied_actions, get_dividend_log,
+            sync_pending_from_nse, confirm_action, discard_pending,
+        )
+
+        st.markdown('<div class="section-label">Corporate actions</div>', unsafe_allow_html=True)
+        corp_symbols = sorted({p.get("Symbol") for p in engine.open_positions if p.get("Symbol")})
+
+        if st.button("🔄 Check NSE for new actions", key="corp_sync_btn"):
+            try:
+                added = sync_pending_from_nse(corp_symbols)
+                st.success(f"Found {added} new action(s).") if added else st.info("Nothing new from NSE.")
+            except Exception as e:
+                st.error(f"NSE fetch failed: {e}")
+
+        open_qty_by_symbol = {p["Symbol"]: p["Qty"] for p in engine.open_positions}
+
+        st.markdown("**Pending — awaiting your confirmation**")
+        pending = get_pending_actions()
+        if not pending:
+            st.caption("No pending corporate actions.")
+        for a in pending:
+            with st.container(border=True):
+                st.write(f"**{a['symbol']}** — {a['type']} · Ex-date {a['ex_date']}")
+                st.caption(a.get("raw_purpose", ""))
+                if a.get("confidence") == "low":
+                    st.warning("NSE text didn't parse cleanly — verify ratio/amount before applying.")
+                held_qty = open_qty_by_symbol.get(a["symbol"], 0.0)
+                st.caption(f"Your current open qty (used for bonus/dividend calc): {held_qty}")
+                c1, c2 = st.columns(2)
+                if c1.button("✅ Apply", key=f"corp_apply_{a['id']}"):
+                    confirm_action(a["id"], held_qty_hint=held_qty)
+                    get_engine.clear()
+                    st.rerun()
+                if c2.button("✖ Discard", key=f"corp_discard_{a['id']}"):
+                    discard_pending(a["id"])
+                    st.rerun()
+
+        st.markdown("**Applied history**")
+        applied = get_applied_actions()
+        if applied:
+            st.dataframe(pd.DataFrame(applied), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No corporate actions applied yet.")
+
+        st.markdown("**Dividends received** &nbsp;<span style='color:var(--muted);font-size:.78rem;'>(income only — kept separate from booked P&amp;L)</span>", unsafe_allow_html=True)
+        divs = get_dividend_log()
+        if divs:
+            st.dataframe(pd.DataFrame(divs), hide_index=True, use_container_width=True)
+            st.metric("Total dividends received", f"₹{sum(d['amount'] for d in divs):,.0f}")
+        else:
+            st.caption("No dividends logged yet.")
 
 
 # ── UI ──────────────────────────────────────────────────────────────────
