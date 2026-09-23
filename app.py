@@ -2626,6 +2626,11 @@ def render_live(engine: "LiveEngine"):
                 st.success(f"Found {added} new action(s).") if added else st.info("Nothing new from NSE.")
             except Exception as e:
                 st.error(f"NSE fetch failed: {e}")
+        if st.button("🧹 Clear old/stale pending", key="corp_purge_btn"):
+            from corporate_actions import purge_stale_pending
+            removed = purge_stale_pending()
+            st.info(f"Removed {removed} stale entr{'y' if removed == 1 else 'ies'} outside the recent window.")
+            st.rerun()
 
         open_qty_by_symbol = {}
         for t in ticks:
