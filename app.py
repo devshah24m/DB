@@ -2618,7 +2618,7 @@ def render_live(engine: "LiveEngine"):
         )
 
         st.markdown('<div class="section-label">Corporate actions</div>', unsafe_allow_html=True)
-        corp_symbols = sorted({p.get("Symbol") for p in engine.open_positions if p.get("Symbol")})
+        corp_symbols = sorted({t.get("symbol") for t in ticks if t.get("symbol")})
 
         if st.button("🔄 Check NSE for new actions", key="corp_sync_btn"):
             try:
@@ -2627,7 +2627,10 @@ def render_live(engine: "LiveEngine"):
             except Exception as e:
                 st.error(f"NSE fetch failed: {e}")
 
-        open_qty_by_symbol = {p["Symbol"]: p["Qty"] for p in engine.open_positions}
+        open_qty_by_symbol = {}
+        for t in ticks:
+            if t.get("symbol"):
+                open_qty_by_symbol[t["symbol"]] = open_qty_by_symbol.get(t["symbol"], 0) + (t.get("qty") or 0)
 
         st.markdown("**Pending — awaiting your confirmation**")
         pending = get_pending_actions()
