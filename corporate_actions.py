@@ -92,6 +92,13 @@ def get_dividend_log() -> list:
 NSE_BASE = "https://www.nseindia.com"
 NSE_ACTIONS_URL = f"{NSE_BASE}/api/corporates-corporateActions"
 
+# Only actions whose ex-date falls in this window (relative to "today") are
+# surfaced as Pending. NSE's API returns YEARS of history by default, which
+# is not what you want cluttering the tab — this keeps it to what's actually
+# actionable right now.
+RECENT_BACK_DAYS = 45     # how far in the past an ex-date can be and still show
+RECENT_FORWARD_DAYS = 30  # how far in the future ("forthcoming") to show
+
 _HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
@@ -112,17 +119,26 @@ def _nse_session() -> requests.Session:
 
 
 def fetch_actions_for_symbol(symbol: str, session: requests.Session | None = None,
-                              retries: int = 2) -> list[dict]:
+                              retries: int = 2, from_date: str | None = None,
+                              to_date: str | None = None) -> list[dict]:
     """Raw NSE JSON rows for one symbol. Each row typically has keys like
     'symbol', 'subject' or 'purpose', 'exDate', 'recDate', 'faceVal',
     'series' — NSE's exact key names have shifted before, so callers should
     use .get(...) defensively (see _extract_purpose/_extract_exdate below).
+    from_date/to_date (DD-MM-YYYY): narrows NSE's response server-side to
+    avoid pulling years of history; still re-filtered client-side as a
+    safety net in sync_pending_from_nse in case NSE ignores these params.
     """
     last_err = None
+    params = {"index": "equities", "symbol": symbol}
+    if from_date:
+        params["from_date"] = from_date
+    if to_date:
+        params["to_date"] = to_date
     for attempt in range(retries + 1):
         s = session or _nse_session()
         try:
-            r = s.get(NSE_ACTIONS_URL, params={"index": "equities", "symbol": symbol}, timeout=15)
+            r = s.get(NSE_ACTIONS_URL, params=params, timeout=15)
             r.raise_for_status()
             data = r.json()
             return data if isinstance(data, list) else data.get("data", [])
@@ -192,18 +208,47 @@ def parse_purpose(purpose: str) -> dict | None:
 
 
 # ── Sync: pull NSE actions for held symbols into the Pending list ─────────
+def purge_stale_pending() -> int:
+    """Removes any Pending entries whose ex-date falls outside the recent
+    window — cleans up old history that got added before this filtering
+    existed, or that's simply aged out since. Returns count removed."""
+    store = _load_store()
+    today = pd.Timestamp(date.today())
+    lo = today - pd.Timedelta(days=RECENT_BACK_DAYS)
+    hi = today + pd.Timedelta(days=RECENT_FORWARD_DAYS)
+    before = len(store["pending"])
+    store["pending"] = [
+        a for a in store["pending"]
+        if lo <= pd.to_datetime(a["ex_date"], errors="coerce") <= hi
+    ]
+    removed = before - len(store["pending"])
+    if removed:
+        _save_store(store)
+    return removed
+
+
 def sync_pending_from_nse(symbols: list[str]) -> int:
     """Fetches NSE actions for each symbol, parses them, and adds any new
-    ones to Pending (deduped by symbol+exDate+raw purpose). Returns count
+    ones within the recent window (RECENT_BACK_DAYS..RECENT_FORWARD_DAYS)
+    to Pending — deduped by symbol+exDate+raw purpose. Also purges any
+    already-stored pending entries that have since aged out. Returns count
     of newly added pending actions. Safe to call repeatedly."""
+    purge_stale_pending()
     store = _load_store()
     seen = set(store["seen_keys"])
     added = 0
     session = _nse_session()
 
+    today = pd.Timestamp(date.today())
+    lo = today - pd.Timedelta(days=RECENT_BACK_DAYS)
+    hi = today + pd.Timedelta(days=RECENT_FORWARD_DAYS)
+    from_date_str = lo.strftime("%d-%m-%Y")
+    to_date_str = hi.strftime("%d-%m-%Y")
+
     for sym in symbols:
         try:
-            raw_rows = fetch_actions_for_symbol(sym, session=session)
+            raw_rows = fetch_actions_for_symbol(sym, session=session,
+                                                 from_date=from_date_str, to_date=to_date_str)
         except Exception as e:
             store.setdefault("fetch_errors", {})[sym] = str(e)
             continue
@@ -216,6 +261,9 @@ def sync_pending_from_nse(symbols: list[str]) -> int:
             ex_date = _extract_exdate(raw)
             if pd.isna(ex_date):
                 continue
+            if not (lo <= ex_date <= hi):
+                continue  # outside the recent window — skip (don't mark seen,
+                          # so it gets picked up again once it's actually near)
             ex_date_str = ex_date.strftime("%Y-%m-%d")
             key = f"{sym}|{ex_date_str}|{purpose}"
             if key in seen:
